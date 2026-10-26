@@ -12,6 +12,7 @@ function validRecord(overrides = {}) {
     domain: "POS",
     type: "pos_transaction",
     branchCode: "BR-001",
+    investigationReference: "API-VALIDATION-TEST",
     occurredAt: "2026-10-22T10:00:00Z",
     fields: {
       status: "accepted",

@@ -25,8 +25,13 @@ function timestamp(day: number, hour = 10): string {
   ).toISOString();
 }
 
-function add(record: EvidenceRecord): void {
-  records.push(record);
+function add(
+  record: Omit<EvidenceRecord, "investigationReference">,
+): void {
+  records.push({
+    ...record,
+    investigationReference: "NS-BENCHMARK",
+  });
 }
 
 // Baseline: 12 branches x 90 days.

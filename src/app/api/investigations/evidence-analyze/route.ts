@@ -1,5 +1,6 @@
 
 import { NextResponse } from "next/server";
+import { validateEvidenceInvestigationReport } from "@/lib/finding-validation";
 import {
   investigateEvidence,
   type EvidenceRecord,
@@ -118,9 +119,12 @@ function isEvidenceRecord(value: unknown): value is EvidenceRecord {
     (record.reference !== undefined &&
       (typeof record.reference !== "string" ||
         record.reference.length > 200)) ||
-    !record.fields ||
+        !record.fields ||
     typeof record.fields !== "object" ||
-    Array.isArray(record.fields)
+    Array.isArray(record.fields) ||
+    typeof record.investigationReference !== "string" ||
+    record.investigationReference.trim().length === 0 ||
+    record.investigationReference.length > 100
   ) {
     return false;
   }
@@ -181,6 +185,23 @@ export async function POST(request: Request) {
     }
 
     const records = body.records as EvidenceRecord[];
+    const targetReference = body.targetReference.trim();
+
+if (
+  records.some(
+    (record) =>
+      record.investigationReference !== targetReference,
+  )
+) {
+  return NextResponse.json(
+    {
+      success: false,
+      error:
+        "Every evidence record must be explicitly associated with the selected investigation.",
+    },
+    { status: 400 },
+  );
+}
     const ids = records.map((record) => record.id);
 
     if (new Set(ids).size !== ids.length) {
@@ -194,10 +215,27 @@ export async function POST(request: Request) {
     }
 
     const report = investigateEvidence({
-      targetReference: body.targetReference.trim(),
+      targetReference,
       records,
     });
 
+    if (
+      !validateEvidenceInvestigationReport(
+        report,
+        targetReference,
+        records,
+      )
+    ) {
+      console.error("AEGIS generated an invalid evidence investigation report.");
+
+      return NextResponse.json(
+        {
+          success: false,
+          error: "The generated report failed evidence validation.",
+        },
+        { status: 500 },
+      );
+    }
     return NextResponse.json({
       success: true,
       engine: "AEGIS Evidence Investigation Engine",

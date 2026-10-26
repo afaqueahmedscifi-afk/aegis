@@ -14,6 +14,8 @@ function record(
   return {
     branchCode: "BR-001",
     occurredAt: "2026-10-20T10:00:00.000Z",
+    investigationReference:
+      overrides.investigationReference ?? "UNASSIGNED",
     ...overrides,
   };
 }
@@ -116,6 +118,12 @@ const scenarios = {
 };
 
 // Benchmark expectations are separate from engine input.
+for (const scenario of Object.values(scenarios)) {
+  scenario.records = scenario.records.map((item) => ({
+    ...item,
+    investigationReference: scenario.targetReference,
+  }));
+}
 const expectedOutcomes = {
   posSyncFailure: {
     expectedFindingPrefix: "POS-CLOSE-",
@@ -139,7 +147,7 @@ test("POS synchronization failure produces a traceable reconciliation finding", 
   );
 
   assert.ok(finding, "Expected a POS reconciliation finding");
-  assert.equal(finding.confidence, "High");
+  assert.equal(finding.confidence, "Medium");
 
   for (const evidenceId of expected.requiredEvidenceIds) {
     assert.ok(
@@ -211,4 +219,262 @@ test("investigation report preserves its target reference", () => {
     const report = investigateEvidence(scenario);
     assert.equal(report.targetReference, scenario.targetReference);
   }
+});
+test("accepted POS transaction missing from a completed batch is flagged without a sync failure", () => {
+  const records = scenarios.posSyncFailure.records
+    .filter((item) => item.type !== "sync_event")
+    .map((item) => ({
+      ...item,
+      investigationReference: "NS-POS-MISSING-FROM-BATCH",
+    }));
+
+  const report = investigateEvidence({
+    targetReference: "NS-POS-MISSING-FROM-BATCH",
+    records,
+  });
+
+  const finding = report.findings.find((item) =>
+    item.id.startsWith("POS-CLOSE-"),
+  );
+
+  assert.ok(
+    finding,
+    "Expected a finding when the completed batch omits the transaction",
+  );
+
+  assert.equal(finding.confidence, "Medium");
+  assert.ok(finding.supportingEvidenceIds.includes("EV-POS-001"));
+  assert.ok(finding.supportingEvidenceIds.includes("EV-POS-003"));
+  assert.match(finding.explanation, /accepted/i);
+  assert.ok(finding.limitations.length > 0);
+});
+
+test("POS close reconciliation reports a supported settlement difference", () => {
+  const targetReference = "AEGIS-SIM-POS-CLOSE-001";
+
+  const records = [
+    record({
+      id: "POS-001-01",
+      domain: "POS",
+      type: "pos_close_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "BATCH-001",
+        salesTotal: 5000,
+        voidTotal: 0,
+        refundTotal: 0,
+        currency: "SAR",
+      },
+    }),
+    record({
+      id: "POS-001-02",
+      domain: "PAYMENTS",
+      type: "settlement_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "BATCH-001",
+        settledTotal: 4600,
+        currency: "SAR",
+      },
+    }),
+    record({
+      id: "POS-001-03",
+      domain: "POS",
+      type: "pos_transaction",
+      investigationReference: targetReference,
+      fields: {
+        transactionId: "TX-101",
+        status: "accepted",
+        amount: 400,
+        batchId: "BATCH-001",
+      },
+    }),
+    record({
+      id: "POS-001-05",
+      domain: "PAYMENTS",
+      type: "payment_event",
+      investigationReference: targetReference,
+      fields: {
+        transactionId: "TX-101",
+        authorizationStatus: "approved",
+        captureStatus: "pending",
+        amount: 400,
+        currency: "SAR",
+      },
+    }),
+  ];
+
+  const report = investigateEvidence({ targetReference, records });
+  const finding = report.findings.find((item) =>
+    item.id.startsWith("POS-RECON-"),
+  );
+
+  assert.ok(finding, "Expected a numerical settlement discrepancy finding");
+  assert.match(finding.explanation, /400/);
+  assert.match(finding.explanation, /SAR/);
+
+  for (const id of ["POS-001-01", "POS-001-02"]) {
+    assert.ok(finding.supportingEvidenceIds.includes(id));
+  }
+
+  assert.ok(
+    finding.limitations.length > 0,
+    "The finding must explain what remains unverified",
+  );
+});
+
+test("POS settlement difference does not claim a confirmed loss when refunds and voids exist", () => {
+  const targetReference = "AEGIS-POS-REFUNDS-TEST";
+
+  const records = [
+    record({
+      id: "POS-REFUND-CLOSE",
+      domain: "POS",
+      type: "pos_close_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "BATCH-REFUND-001",
+        salesTotal: 5000,
+        voidTotal: 200,
+        refundTotal: 300,
+        currency: "SAR",
+      },
+    }),
+    record({
+      id: "POS-REFUND-SETTLEMENT",
+      domain: "PAYMENTS",
+      type: "settlement_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "BATCH-REFUND-001",
+        settledTotal: 4500,
+        currency: "SAR",
+      },
+    }),
+  ];
+
+  const report = investigateEvidence({ targetReference, records });
+  const finding = report.findings.find((item) =>
+    item.id.startsWith("POS-RECON-"),
+  );
+
+  assert.ok(finding, "Expected a reconciliation difference finding");
+  assert.match(finding.explanation, /5000\.00/);
+  assert.match(finding.explanation, /4500\.00/);
+  assert.ok(
+    finding.limitations.some((limitation) =>
+      /accounting scopes|refund|void|timing/i.test(limitation),
+    ),
+    "The finding should acknowledge accounting-scope or timing uncertainty",
+  );
+  assert.doesNotMatch(finding.title, /lost money|confirmed loss/i);
+});
+
+test("POS settlement reconciliation skips summaries with missing currency", () => {
+  const targetReference = "AEGIS-POS-MISSING-CURRENCY";
+
+  const records = [
+    record({
+      id: "POS-MISSING-CURRENCY-CLOSE",
+      domain: "POS",
+      type: "pos_close_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "BATCH-MISSING-CURRENCY",
+        salesTotal: 5000,
+        currency: "SAR",
+      },
+    }),
+    record({
+      id: "POS-MISSING-CURRENCY-SETTLEMENT",
+      domain: "PAYMENTS",
+      type: "settlement_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "BATCH-MISSING-CURRENCY",
+        settledTotal: 4600,
+      },
+    }),
+  ];
+
+  const report = investigateEvidence({ targetReference, records });
+
+  assert.equal(
+    report.findings.some((item) => item.id.startsWith("POS-RECON-")),
+    false,
+    "A settlement without currency must not be compared to a currency-specific POS total",
+  );
+});
+
+test("duplicate pending payment events are not double-counted in the diagnostic lead", () => {
+  const targetReference = "AEGIS-POS-DUPLICATE-PAYMENT-TEST";
+
+  const records = [
+    record({
+      id: "DUP-POS-CLOSE",
+      domain: "POS",
+      type: "pos_close_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "DUP-BATCH-001",
+        salesTotal: 5000,
+        currency: "SAR",
+      },
+    }),
+    record({
+      id: "DUP-SETTLEMENT",
+      domain: "PAYMENTS",
+      type: "settlement_summary",
+      investigationReference: targetReference,
+      fields: {
+        batchId: "DUP-BATCH-001",
+        settledTotal: 4600,
+        currency: "SAR",
+      },
+    }),
+    record({
+      id: "DUP-POS-TX",
+      domain: "POS",
+      type: "pos_transaction",
+      investigationReference: targetReference,
+      fields: {
+        transactionId: "TX-DUP-001",
+        status: "accepted",
+        amount: 400,
+        batchId: "DUP-BATCH-001",
+      },
+    }),
+    ...["DUP-PAYMENT-EVENT-1", "DUP-PAYMENT-EVENT-2"].map((id) =>
+      record({
+        id,
+        domain: "PAYMENTS",
+        type: "payment_event",
+        investigationReference: targetReference,
+        fields: {
+          transactionId: "TX-DUP-001",
+          captureStatus: "pending",
+          amount: 400,
+          currency: "SAR",
+        },
+      }),
+    ),
+  ];
+
+  const report = investigateEvidence({ targetReference, records });
+  const finding = report.findings.find((item) =>
+    item.id.startsWith("POS-RECON-"),
+  );
+
+  assert.ok(finding, "Expected a POS reconciliation finding");
+  assert.match(
+    finding.explanation,
+    /pending payment captures total SAR 400\.00/,
+    "Repeated events for one transaction should not inflate its pending amount",
+  );
+  assert.ok(
+    finding.limitations.some((limitation) =>
+      /overlap|discrepanc/i.test(limitation),
+    ),
+    "The finding should retain its uncertainty limitation",
+  );
 });

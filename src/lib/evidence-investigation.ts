@@ -13,6 +13,7 @@ export interface EvidenceRecord {
   branchCode: string;
   occurredAt: string;
   reference?: string;
+  investigationReference: string;
   fields: Record<string, EvidenceValue>;
 }
 
@@ -110,16 +111,19 @@ function detectPosCloseIssues(
         textField(batch, "batchId") === batchId,
     );
 
-    if (batchId && relevantBatch) {
-      const includedIds = field(relevantBatch, "transactionIds");
-      const included =
-        Array.isArray(includedIds) &&
-        includedIds.includes(transaction.id);
+let includedInCompletedBatch = false;
 
-      if (included) {
-        continue;
-      }
-    }
+if (batchId && relevantBatch) {
+  const includedIds = field(relevantBatch, "transactionIds");
+
+  includedInCompletedBatch =
+    Array.isArray(includedIds) &&
+    includedIds.includes(transaction.id);
+
+  if (includedInCompletedBatch) {
+    continue;
+  }
+}
 
     const failedSync = failedSyncEvents.find(
       (event) =>
@@ -127,7 +131,12 @@ function detectPosCloseIssues(
         textField(event, "transactionId") === transaction.id,
     );
 
-    if (!batchId || !relevantBatch || failedSync) {
+    if (
+  !batchId ||
+  !relevantBatch ||
+  !includedInCompletedBatch ||
+  failedSync
+) {
       const evidenceIds = unique([
         transaction.id,
         ...(relevantBatch ? [relevantBatch.id] : []),
@@ -142,7 +151,7 @@ function detectPosCloseIssues(
         explanation: failedSync
           ? `Transaction ${transaction.id} was accepted, and a failed synchronization event references that transaction. The available records warrant checking whether the failure affected day-close reconciliation.`
           : `Transaction ${transaction.id} was accepted, but the available records do not establish its inclusion in a completed close batch.`,
-        confidence: failedSync ? "High" : "Medium",
+        confidence: "Medium",
         supportingEvidenceIds: evidenceIds,
 
 limitations: [
@@ -159,6 +168,141 @@ limitations: [
 
       });
     }
+  }
+
+  return findings;
+}
+
+function detectPosSettlementDifferences(
+  records: EvidenceRecord[],
+): InvestigationFinding[] {
+  const findings: InvestigationFinding[] = [];
+
+  const closeSummaries = records.filter(
+    (record) => record.type === "pos_close_summary",
+  );
+  const settlements = records.filter(
+    (record) => record.type === "settlement_summary",
+  );
+
+  for (const close of closeSummaries) {
+    const batchId = textField(close, "batchId");
+    const salesTotal = numberField(close, "salesTotal");
+    const closeCurrency = textField(close, "currency");
+
+    if (!batchId || salesTotal === undefined || !closeCurrency) {
+      continue;
+    }
+
+    const settlement = settlements.find(
+      (record) =>
+        record.branchCode === close.branchCode &&
+        textField(record, "batchId") === batchId &&
+        textField(record, "currency") === closeCurrency,
+    );
+
+    if (!settlement) continue;
+
+    const settledTotal = numberField(settlement, "settledTotal");
+    if (settledTotal === undefined) continue;
+
+    const difference = Math.round((salesTotal - settledTotal) * 100) / 100;
+    if (difference <= 0) continue;
+
+    const evidenceIds = [close.id, settlement.id];
+
+    const pendingPayments = records.filter(
+      (record) =>
+        record.type === "payment_event" &&
+        record.branchCode === close.branchCode &&
+        textField(record, "currency") === closeCurrency &&
+        textField(record, "captureStatus")?.toLowerCase() === "pending" &&
+        numberField(record, "amount") !== undefined,
+    );
+
+    const matchingPendingPayments = pendingPayments.filter(
+      (payment) =>
+        textField(payment, "transactionId") !== undefined &&
+        records.some(
+          (record) =>
+            record.type === "pos_transaction" &&
+            record.branchCode === close.branchCode &&
+            textField(record, "transactionId") ===
+              textField(payment, "transactionId") &&
+            textField(record, "batchId") === batchId,
+        ),
+    );
+
+
+const pendingByTransaction = new Map<string, number>();
+
+for (const payment of matchingPendingPayments) {
+  const transactionId = textField(payment, "transactionId");
+  const amount = numberField(payment, "amount");
+
+  if (!transactionId || amount === undefined) continue;
+
+  // Count a transaction once, even if multiple pending events exist.
+  // If duplicate events disagree on amount, keep the largest amount
+  // as a conservative lead and let the finding's limitations explain uncertainty.
+  const existingAmount = pendingByTransaction.get(transactionId);
+
+  if (existingAmount === undefined || amount > existingAmount) {
+    pendingByTransaction.set(transactionId, amount);
+  }
+}
+
+const pendingAmount =
+  Math.round(
+    [...pendingByTransaction.values()].reduce(
+      (total, amount) => total + amount,
+      0,
+    ) * 100,
+  ) / 100;
+
+
+    evidenceIds.push(
+      ...matchingPendingPayments.map((payment) => payment.id),
+      ...records
+        .filter(
+          (record) =>
+            record.type === "pos_transaction" &&
+            record.branchCode === close.branchCode &&
+            textField(record, "batchId") === batchId &&
+            matchingPendingPayments.some(
+              (payment) =>
+                textField(payment, "transactionId") ===
+                textField(record, "transactionId"),
+            ),
+        )
+        .map((record) => record.id),
+    );
+
+    findings.push({
+      id: findingId("POS-RECON", evidenceIds),
+      title: "POS sales total exceeds payment settlement total",
+      explanation:
+        `Batch ${batchId} records POS sales of ${closeCurrency} ${salesTotal.toFixed(2)} ` +
+        `and settlement of ${closeCurrency} ${settledTotal.toFixed(2)}, ` +
+        `a difference of ${closeCurrency} ${difference.toFixed(2)}.` +
+        (pendingAmount > 0
+          ? ` Related pending payment captures total ${closeCurrency} ${pendingAmount.toFixed(2)}; ` +
+            "this is a possible lead, not proof of the cause."
+          : ""),
+      confidence: "Medium",
+      supportingEvidenceIds: unique(evidenceIds),
+      limitations: [
+        "The reported difference is based on the supplied summary records and has not been independently verified.",
+        "POS sales and payment settlement totals may use different accounting scopes or timing.",
+        ...(pendingAmount > 0
+          ? [
+              "Pending capture amounts may overlap with other discrepancies and must not be assumed to explain the full difference.",
+            ]
+          : [
+              "Inspect transaction-level reconciliation and settlement timing before assigning a cause.",
+            ]),
+      ],
+    });
   }
 
   return findings;
@@ -222,7 +366,7 @@ function detectPossibleDuplicateInventoryPostings(
       supportingEvidenceIds: evidenceIds,
       limitations: [
         `Branch: ${branchCode}; SKU: ${sku}.`,
-        "Repeated quantities do not alone prove duplication; legitimate split or reversal-and-repost workflows must be ruled out.",
+        `Repeated quantities do not alone prove duplication; legitimate split or reversal-and-repost workflows must be ruled out.`,
         "Verify the supplier document, posting timestamps, reversal records, and physical stock count before assigning root cause.",
       ],
     });
@@ -231,14 +375,73 @@ function detectPossibleDuplicateInventoryPostings(
   return findings;
 }
 
+function generateDiagnosticLeads(
+  records: EvidenceRecord[],
+): InvestigationFinding[] {
+  const leads: InvestigationFinding[] = [];
+
+  for (const record of records) {
+    const searchableText = [
+      record.reference ?? "",
+      ...Object.values(record.fields).map((value) =>
+        Array.isArray(value) ? value.join(" ") : String(value ?? ""),
+      ),
+    ]
+      .join(" ")
+      .toLowerCase();
+
+    // Only explicit zero-value evidence creates a diagnostic lead.
+    // Ordinary order/POS record types alone are not enough.
+    if (
+      /zero.?value|zero.?amount|zero.?total|amount.?zero|value.?zero/.test(
+        searchableText,
+      )
+    ) {
+      leads.push({
+        id: findingId("DIAGNOSTIC", [record.id]),
+        title: "Investigate a zero-value order or transaction",
+        explanation:
+          "The supplied evidence explicitly references a possible zero-value condition. The reason remains undetermined.",
+        confidence: "Low",
+        supportingEvidenceIds: [record.id],
+        limitations: [
+          "This is a diagnostic lead, not a confirmed finding or root cause.",
+          "Compare original order totals with POS and payment records.",
+          "Verify prices, discounts, promotions, tax, and payment status.",
+          "Inspect integration logs and match the order ID across systems.",
+          "Verify all checks against original system records.",
+        ],
+      });
+    }
+
+    // A general inventory or close-batch mention is not an anomaly.
+    // Dedicated POS-close and duplicate-inventory detectors handle
+    // evidence-backed patterns in those domains.
+  }
+
+  return leads;
+}
+
 export function investigateEvidence(
   input: EvidenceInvestigationInput,
 ): EvidenceInvestigationReport {
   const records = input.records;
+    if (
+    records.some(
+      (record) =>
+        record.investigationReference !== input.targetReference,
+    )
+  ) {
+    throw new Error(
+      "Every evidence record must be explicitly associated with the target investigation.",
+    );
+  }
   const findings = [
-    ...detectPosCloseIssues(records),
-    ...detectPossibleDuplicateInventoryPostings(records),
-  ];
+  ...detectPosCloseIssues(records),
+  ...detectPossibleDuplicateInventoryPostings(records),
+  ...generateDiagnosticLeads(records),
+  ...detectPosSettlementDifferences(records),
+];
 
   const observedFacts = records.map(
     (record) =>

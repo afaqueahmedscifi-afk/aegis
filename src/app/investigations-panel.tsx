@@ -1,5 +1,6 @@
-
 "use client";
+
+import type { InvestigationHypothesis } from "@/lib/investigation-engine";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 
@@ -50,6 +51,58 @@ type EvidenceReport = {
   conclusion: string;
 };
 
+
+type AiReport = {
+  observed_facts: {
+    statement: string;
+    source_references: string[];
+  }[];
+  hypotheses: {
+    statement: string;
+    supporting_references: string[];
+    limitations: string;
+  }[];
+  missing_information: string[];
+  conclusion: string;
+};
+type AiAnalysisResult = {
+  engine: string;
+  model: string;
+  generatedAt: string;
+  evidenceReferences: string[];
+  deterministicCorrelation: {
+    relatedIncidents: unknown[];
+    hypotheses: InvestigationHypothesis[];
+    warning: string;
+  };
+  ai: AiReport;
+  limitations: string[];
+};
+
+type AiInvestigationReport = {
+  observed_facts: string[];
+  hypotheses: {
+    explanation: string;
+    supporting_incidents: string[];
+    confidence: "High" | "Medium" | "Low";
+  }[];
+  deterministic_hypotheses: {
+    title: string;
+    explanation: string;
+    supporting_incidents: string[];
+    confidence: "Low" | "Moderate";
+    limitations: string;
+  }[];
+  missing_information: string[];
+  conclusion: string;
+};
+
+type AiAnalysisResponse = {
+  success?: boolean;
+  error?: string;
+  model?: string;
+  report?: AiAnalysisResult;
+};
 const severityRank: Record<Severity, number> = {
   Critical: 4,
   High: 3,
@@ -90,6 +143,10 @@ export default function InvestigationsPanel({
   const [analyzingEvidence, setAnalyzingEvidence] = useState(false);
   const [evidenceAnalysisError, setEvidenceAnalysisError] = useState("");
 
+  const [aiReport, setAiReport] =
+  useState<AiInvestigationReport | null>(null);
+  const [analyzingAi, setAnalyzingAi] = useState(false);
+  const [aiAnalysisError, setAiAnalysisError] = useState("");
   useEffect(() => {
   let cancelled = false;
 
@@ -189,7 +246,7 @@ function updateIncident(id: string, changes: Partial<Incident>) {
     ),
   );
 
-  setSaveMessage("Unsaved changes — select SAVE CHANGES to persist.");
+  setSaveMessage("Unsaved changes â€” select SAVE CHANGES to persist.");
   setApiError("");
 }
 
@@ -422,6 +479,76 @@ async function analyzeSelectedEvidence() {
   }
 }
 
+async function analyzeSelectedWithAi() {
+  if (!selected || analyzingAi) return;
+
+  setAnalyzingAi(true);
+  setAiAnalysisError("");
+  setAiReport(null);
+
+  try {
+    const response = await fetch("/api/investigations/ai-analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reference: selected.id }),
+    });
+
+    const payload: unknown = await response.json();
+
+    if (!payload || typeof payload !== "object") {
+      throw new Error("The AI API returned an invalid response.");
+    }
+
+    const result = payload as {
+      success?: boolean;
+      error?: string;
+      report?: AiAnalysisResult;
+    };
+
+    if (!response.ok || !result.success || !result.report?.ai) {
+      throw new Error(result.error ?? "AI analysis failed.");
+    }
+
+    const report = result.report;
+
+   setAiReport({
+  observed_facts: report.ai.observed_facts.map(
+    (item) => item.statement,
+  ),
+  hypotheses: report.ai.hypotheses.map((item) => ({
+    explanation: item.statement,
+    supporting_incidents: item.supporting_references,
+    confidence: "Low",
+  })),
+  deterministic_hypotheses:
+    report.deterministicCorrelation.hypotheses
+      .filter(
+        (item) =>
+          item.title !== "Insufficient correlated evidence" &&
+          item.supportingReferences.length > 0,
+      )
+      .map((item) => ({
+        title: item.title,
+        explanation: item.explanation,
+        supporting_incidents: item.supportingReferences,
+        confidence: item.confidence,
+        limitations: item.limitations,
+      })),
+  missing_information: report.ai.missing_information,
+  conclusion: report.ai.conclusion,
+});
+
+  } catch (error) {
+    setAiAnalysisError(
+      error instanceof Error
+        ? error.message
+        : "An unexpected error occurred during AI analysis.",
+    );
+  } finally {
+    setAnalyzingAi(false);
+  }
+}
+
   function exportIncident(item: Incident) {
     const blob = new Blob([JSON.stringify(item, null, 2)], {
       type: "application/json",
@@ -467,7 +594,7 @@ async function analyzeSelectedEvidence() {
         </div>
       </div>
     {!loaded && (
-  <p role="status">Loading investigations from the database…</p>
+  <p role="status">Loading investigations from the databaseâ€¦</p>
 )}
 
 {apiError && (
@@ -478,7 +605,7 @@ async function analyzeSelectedEvidence() {
 
 {loaded && !apiError && (
   <p role="status">
-    Database connected · {incidents.length} registered incident(s)
+    Database connected Â· {incidents.length} registered incident(s)
   </p>
 )}
       <div className="investigation-metrics">
@@ -554,7 +681,7 @@ async function analyzeSelectedEvidence() {
             </label>
           </div>
           <button className="green-button" type="submit" disabled={saving}>
-  {saving ? "SAVING TO DATABASE…" : "CREATE CASE"}
+  {saving ? "SAVING TO DATABASEâ€¦" : "CREATE CASE"}
 </button>
         </form>
       )}
@@ -602,7 +729,7 @@ async function analyzeSelectedEvidence() {
                   </span>
                 </div>
                 <strong>{item.title}</strong>
-                <small>{item.branch} · {item.category}</small>
+                <small>{item.branch} Â· {item.category}</small>
                 <div className="investigation-case-bottom">
                   <span>{item.status}</span><span>Updated {item.updatedAt}</span>
                 </div>
@@ -692,6 +819,14 @@ async function analyzeSelectedEvidence() {
   >
     {analyzingEvidence ? "ANALYZING EVIDENCE..." : "ANALYZE EVIDENCE"}
   </button>
+  <button
+    type="button"
+    className="green-button"
+    disabled={!selected || analyzingAi}
+    onClick={analyzeSelectedWithAi}
+  >
+    {analyzingAi ? "RUNNING AI ANALYSIS..." : "AI ANALYSIS"}
+  </button>
 </div>
 
 {evidenceAnalysisError && (
@@ -747,6 +882,82 @@ async function analyzeSelectedEvidence() {
     <p>Findings are investigative leads, not confirmed root causes.</p>
   </div>
 )}
+{aiAnalysisError && (
+  <p role="alert" style={{ color: "#e07070" }}>
+    {aiAnalysisError}
+  </p>
+)}
+
+{aiReport && (
+  <section className="investigation-evidence-report" aria-live="polite">
+    <div className="eyebrow">AEGIS AI INVESTIGATION REPORT</div>
+    <h3>AI analysis results</h3>
+    <h4>Conclusion</h4>
+    <p>{aiReport.conclusion}</p>
+    <h4>Observed facts</h4>
+    {aiReport.observed_facts.length === 0 ? (
+      <p>No observed facts were returned.</p>
+    ) : (
+      <ul>
+        {aiReport.observed_facts.map((fact, index) => (
+          <li key={`ai-fact-${index}`}>{fact}</li>
+        ))}
+      </ul>
+    )}
+    <h4>Hypotheses</h4>
+    {aiReport.hypotheses.length === 0 ? (
+      <p>No hypotheses were returned.</p>
+    ) : (
+      aiReport.hypotheses.map((hypothesis, index) => (
+        <article key={`ai-hypothesis-${index}`}>
+          <p>{hypothesis.explanation}</p>
+          <p><strong>UI confidence label:</strong> {hypothesis.confidence}</p>
+          <p>
+            <strong>Supporting references:</strong>{" "}
+            {hypothesis.supporting_incidents.length
+              ? hypothesis.supporting_incidents.join(", ")
+              : "None provided"}
+          </p>
+        </article>
+      ))
+    )}
+    <h4>Rule-based investigative leads</h4>
+    {aiReport.deterministic_hypotheses.length === 0 ? (
+      <p>No rule-based leads with supporting incident references were found.</p>
+    ) : (
+      aiReport.deterministic_hypotheses.map((hypothesis, index) => (
+        <article key={`rule-hypothesis-${index}`}>
+          <h5>{hypothesis.title}</h5>
+          <p>{hypothesis.explanation}</p>
+          <p>
+            <strong>Rule-based confidence:</strong>{" "}
+            {hypothesis.confidence}
+          </p>
+          <p>
+            <strong>Supporting references:</strong>{" "}
+            {hypothesis.supporting_incidents.join(", ")}
+          </p>
+          <p>
+            <strong>Limitations:</strong> {hypothesis.limitations}
+          </p>
+        </article>
+      ))
+    )}
+
+    <h4>Missing information</h4>
+    {aiReport.missing_information.length === 0 ? (
+      <p>No missing information was listed.</p>
+    ) : (
+      <ul>
+        {aiReport.missing_information.map((item, index) => (
+          <li key={`ai-missing-${index}`}>{item}</li>
+        ))}
+      </ul>
+    )}
+    <p>AI-generated hypotheses are investigative leads, not confirmed root causes.</p>
+  </section>
+)}
+
 {saveMessage && (
   <p role="status" className="investigation-save-message">
     {saveMessage}
@@ -795,7 +1006,7 @@ async function analyzeSelectedEvidence() {
 </div>
 
       <button className="green-button" onClick={onBack}>
-        ← RETURN TO COMMAND CENTER
+        BACK
       </button>
     </section>
   );

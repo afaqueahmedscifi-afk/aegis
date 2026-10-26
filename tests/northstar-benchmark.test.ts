@@ -26,9 +26,12 @@ test("benchmark detects all planted POS synchronization patterns", () => {
   for (const scenario of scenarios) {
     const report = investigateEvidence({
       targetReference: scenario.scenarioId,
-      records: benchmarkRecords.filter(
-        (record) => record.branchCode === scenario.branchCode,
-      ),
+      records: benchmarkRecords
+  .filter((record) => record.branchCode === scenario.branchCode)
+  .map((record) => ({
+    ...record,
+    investigationReference: scenario.scenarioId,
+  })),
     });
 
     const finding = report.findings.find((item) =>
@@ -57,9 +60,12 @@ test("benchmark detects all planted duplicate inventory patterns", () => {
   for (const scenario of scenarios) {
     const report = investigateEvidence({
       targetReference: scenario.scenarioId,
-      records: benchmarkRecords.filter(
-        (record) => record.branchCode === scenario.branchCode,
-      ),
+      records: benchmarkRecords
+  .filter((record) => record.branchCode === scenario.branchCode)
+  .map((record) => ({
+    ...record,
+    investigationReference: scenario.scenarioId,
+  })),
     });
 
     const finding = report.findings.find((item) =>
@@ -93,7 +99,10 @@ test("normal baseline records do not create findings by themselves", () => {
 
   const report = investigateEvidence({
     targetReference: "NS-BASELINE-ONLY",
-    records: baselineRecords,
+    records: baselineRecords.map((record) => ({
+  ...record,
+  investigationReference: "NS-BASELINE-ONLY",
+})),
   });
 
   assert.equal(
@@ -110,7 +119,10 @@ test("benchmark finding references always point to supplied evidence", () => {
 
   const report = investigateEvidence({
     targetReference: "NS-FULL-BENCHMARK",
-    records: benchmarkRecords,
+    records: benchmarkRecords.map((record) => ({
+      ...record,
+      investigationReference: "NS-FULL-BENCHMARK",
+    })),
   });
 
   for (const finding of report.findings) {
